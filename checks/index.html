@@ -86,7 +86,7 @@ main{min-width:0;border-right:1px solid var(--line)}
 .wait{padding:34px 16px;color:var(--dim);text-align:center;border:1px dashed var(--line);margin-top:12px}
 .wait b{display:block;color:var(--ink);font-weight:600;margin-bottom:4px}
 .rows{display:grid;margin-top:12px;border-top:1px solid var(--line)}
-.row{display:grid;grid-template-columns:minmax(0,1.6fr) 150px 120px 70px;gap:12px;align-items:center;padding:9px 0;border-bottom:1px solid var(--line);min-width:0}
+.row{display:grid;grid-template-columns:minmax(0,1.6fr) 150px 120px 110px;gap:12px;align-items:center;padding:9px 0;border-bottom:1px solid var(--line);min-width:0}
 .row.th{font:500 11px var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--faint);padding:6px 0}
 .row .nm{min-width:0;overflow:hidden}
 .row .nm a{font-weight:600;text-decoration:none}.row .nm a:hover{text-decoration:underline}
@@ -105,6 +105,7 @@ main{min-width:0;border-right:1px solid var(--line)}
 .legend span{display:inline-flex;align-items:center;gap:6px}.legend i{width:9px;height:9px;display:inline-block}
 .legend b{color:var(--ink);font-weight:500}
 .pill{display:inline-block;font:600 10.5px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;padding:4px 6px;border:1px solid var(--line);color:var(--dim)}
+.pill.gel{margin-left:8px;vertical-align:1px;text-decoration:none;color:var(--blue);border-color:currentColor}.pill.gel.bad{color:var(--red)}.pill.gel.none{color:var(--dim)}
 .pill.pass{color:var(--green);border-color:currentColor}.pill.fail,.pill.error{color:var(--red);border-color:currentColor}.pill.report{color:var(--blue)}
 .srow{grid-template-columns:minmax(0,1fr) 64px 170px}
 aside{padding:20px 20px 30px;position:sticky;top:56px;align-self:start;max-height:calc(100vh - 56px);overflow:auto}
@@ -274,6 +275,16 @@ footer a{color:var(--dim)}
   }
   const passCell = (v) => { const c = el("div", "tc" + (v == null ? " none" : "")); if (v != null) { const i = el("i"); i.style.width = v + "%"; i.style.background = v >= 95 ? "var(--green)" : v >= 80 ? "var(--amber)" : "var(--red)"; c.appendChild(i); } c.appendChild(el("em", "", v == null ? "no runs" : v + "%")); return c; };
 
+  // GEL badge: lane plus a red count of failing-guard findings, linking to the latest GEL run. Old snapshots have no gel field.
+  function gelPill(g) {
+    if (!g || !g.installed) return null;
+    const bad = (g.guards || []).filter((x) => !x.pass).reduce((n, x) => n + (x.findings || 0), 0);
+    const a = el("a", "pill gel" + (bad ? " bad" : g.lane ? "" : " none"), "GEL" + (g.lane ? " " + g.lane : "") + (bad ? " · " + bad : ""));
+    if (g.runUrl) a.href = g.runUrl;
+    a.title = g.lane ? `GEL lane ${g.lane}${g.needsPerson ? ", needs a person" : ""}${(g.blocked || []).length ? ", blocked by " + g.blocked.join(", ") : ""}` : "GEL is installed; no record in the latest run";
+    return a;
+  }
+
   function kpis() {
     const t = st.d.totals, s = st.d.scores ? st.d.scores.rows : [];
     const failing = s.filter((r) => r.status === "fail" || r.status === "error").length, gated = s.filter((r) => r.mode !== "report").length;
@@ -285,6 +296,7 @@ footer a{color:var(--dim)}
       [t.runs ?? "–", "runs read", ""],
       [t.ciMinutes == null ? "–" : (t.ciMinutes / 60).toFixed(0) + " h", "CI time in window", ""],
       [t.sdlcReady == null ? "–" : t.sdlcReady + "/" + t.repos, "agent-ready", t.sdlcReady ? "ok" : "warn"],
+      [t.gelRepos == null ? "–" : t.gelRepos + "/" + t.repos, t.gelBlocked ? `GEL repos, ${t.gelBlocked} blocked` : "GEL repos", t.gelBlocked || t.gelFindings ? "warn" : t.gelRepos ? "ok" : ""],
       [s.length ? failing + "/" + gated : "–", "gates failing", s.length ? (failing ? "bad" : "ok") : ""],
     ];
     const box = $("kp"); box.textContent = "";
@@ -342,14 +354,15 @@ footer a{color:var(--dim)}
     if (!list.length) return wait(box, "No repo matches.", "Clear the filter to see every repo.");
     box.textContent = "";
     const rows = el("div", "rows");
-    const th = el("div", "row th"); th.append(el("span", "", "Repo"), el("span", "", "14 days"), el("span", "", "Pass rate"), el("span", "n opt", "Median"));
+    const th = el("div", "row th"); th.append(el("span", "", "Repo"), el("span", "", "14 days"), el("span", "", "Pass rate"), el("span", "n opt", "Median / p95"));
     rows.appendChild(th);
     for (const r of list) {
       const row = el("div", "row"), nm = el("div", "nm");
       const red = r.workflows.filter((w) => w.red).length, fl = r.workflows.filter((w) => w.flaky).length;
       nm.append(link(r.url + "/actions", r.name), el("small", "", r.workflows.length ? `${r.workflows.length} workflows · ${red ? red + " red" : "all green"}${fl ? " · " + fl + " flaky" : ""} · ${r.openPRs} PRs` : "no workflow runs on " + r.defaultBranch));
       const sp = el("div"); if (r.days) sp.appendChild(spark(r.days, 150, 26));
-      row.append(nm, sp, passCell(r.passRate), el("span", "n opt", mins(r.medianMinutes)));
+      row.append(nm, sp, passCell(r.passRate), el("span", "n opt", mins(r.medianMinutes) + (r.p95Minutes != null ? " / " + mins(r.p95Minutes) : "")));
+      const gp = gelPill(r.gel); if (gp) nm.firstChild.after(gp);
       if (red) row.querySelector("a").prepend(Object.assign(el("span", "dot red"), { style: "margin-right:8px;vertical-align:1px" }));
       rows.appendChild(row);
     }
@@ -444,11 +457,12 @@ footer a{color:var(--dim)}
     ["Guardrails", ["claims-guard", "local-only", "tracked-secrets", "public-env-secrets", "workflow-permissions"]],
     ["Verification", ["skipped-tests", "workflow-timeouts", "workflow-pr-speed", "github-script-retries", "ade"]],
   ];
+  const sdlcMax = (r) => (r.sdlc.gel === undefined ? 4 : 5); // snapshots from before GEL have four flags
   function sdlc() {
     const box = $("c-sdlc"); box.textContent = "";
     const byId = new Map((st.d.scores ? st.d.scores.rows : []).map((r) => [r.id, r]));
     const repos = allRepos().filter((r) => r.sdlc);
-    $("sdlc-n").textContent = repos.length ? " " + repos.filter((r) => r.sdlc.score === 4).length + "/" + repos.length + " repos ready" : "";
+    $("sdlc-n").textContent = repos.length ? " " + repos.filter((r) => r.sdlc.score === sdlcMax(r)).length + "/" + repos.length + " repos ready" : "";
     const g = el("div", "rows");
     const gh = el("div", "row srow th"); gh.append(el("span", "", "Harness check (flisk-sh/flisk)"), el("span", "", "Status"), el("span", "n opt", "Value"));
     g.appendChild(gh);
@@ -471,8 +485,9 @@ footer a{color:var(--dim)}
     const mark = (ok, label) => ok ? "✓ " + label : "· " + label;
     for (const r of repos.slice().sort((a, b) => a.sdlc.score - b.sdlc.score || a.name.localeCompare(b.name))) {
       const row = el("div", "row"), nm = el("div", "nm");
-      nm.append(link(r.url, r.name), el("small", "", [mark(r.sdlc.agents, "AGENTS.md"), mark(r.sdlc.claude, "CLAUDE.md"), mark(r.sdlc.settings, ".claude"), mark(r.sdlc.ci, "CI")].join("   ")));
-      row.append(nm, el("span", "", ""), el("span", "n", r.sdlc.score + "/4")); t.appendChild(row);
+      nm.append(link(r.url, r.name), el("small", "", [mark(r.sdlc.agents, "AGENTS.md"), mark(r.sdlc.claude, "CLAUDE.md"), mark(r.sdlc.settings, ".claude"), mark(r.sdlc.ci, "CI")].concat(r.sdlc.gel === undefined ? [] : [mark(r.sdlc.gel, "GEL")]).join("   ")));
+      const gp = gelPill(r.gel); if (gp) nm.firstChild.after(gp);
+      row.append(nm, el("span", "", ""), el("span", "n", r.sdlc.score + "/" + sdlcMax(r))); t.appendChild(row);
     }
     box.appendChild(t);
   }

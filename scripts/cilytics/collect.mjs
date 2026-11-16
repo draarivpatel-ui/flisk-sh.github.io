@@ -6,7 +6,10 @@
 // default branch (pull-request runs excluded) and keeps, per workflow, the newest completed run. A workflow is red when
 // that run failed or timed out. Pass rate counts success against failure and timed_out only; cancelled, skipped and
 // neutral runs are left out. No model, no guessing: the same API answers give the same file.
-import { readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 
 const ORG = process.env.CILYTICS_ORG || "flisk-sh";
@@ -135,6 +138,7 @@ export function summarizeRuns(runs, now = Date.now()) {
 		runs: counted.length,
 		passRate: counted.length ? Math.round((pass / counted.length) * 1000) / 10 : null,
 		medianMinutes: median(done.map(minutes)),
+		p95Minutes: percentile(done.map(minutes), 95),
 		ciMinutes: Math.round(done.reduce((n, r) => n + (minutes(r) ?? 0), 0)),
 		conclusions,
 		days: dailyCounts(done, now),
@@ -142,10 +146,69 @@ export function summarizeRuns(runs, now = Date.now()) {
 }
 
 // Pure: names in a repo's root folder -> the AI-SDLC harness flags Cilytics shows. ci comes from the workflow runs.
-export function sdlcFlags(rootNames, workflowCount) {
+export function sdlcFlags(rootNames, workflowCount, gelInstalled = false) {
 	const has = (n) => rootNames.includes(n);
-	const flags = { agents: has("AGENTS.md"), claude: has("CLAUDE.md"), settings: has(".claude"), ci: workflowCount > 0 };
+	const flags = { agents: has("AGENTS.md"), claude: has("CLAUDE.md"), settings: has(".claude"), ci: workflowCount > 0, gel: gelInstalled };
 	return { ...flags, score: Object.values(flags).filter(Boolean).length };
+}
+
+// Pure: is this workflow run a GEL run? The caller's workflow is named "GEL" (flisk-sh/gel itself uses "GEL dogfood");
+// a workflow file called gel.yml counts too.
+export const isGelRun = (r) => r.name === "GEL" || String(r.name || "").startsWith("GEL ") || String(r.path || "").endsWith("/gel.yml");
+
+// Pure: runs (newest first) -> the newest completed GEL run, or undefined.
+export const findGelRun = (runs) => runs.find((r) => r.status === "completed" && isGelRun(r));
+
+// Pure: the last JSON line of gel-record.jsonl (plus the run it came from) -> the repo's gel field.
+// Anything unreadable becomes installed:true with record:null, never an error.
+export function gelFromRecord(text, run = {}) {
+	const base = { installed: true, runUrl: run.html_url ?? null, at: run.updated_at ?? null };
+	try {
+		const lines = String(text ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+		const rec = JSON.parse(lines[lines.length - 1]);
+		if (!rec || typeof rec !== "object" || Array.isArray(rec)) throw new Error("not an object");
+		return {
+			...base,
+			lane: rec.lane ?? null,
+			needsPerson: Boolean(rec.needsPerson),
+			blocked: Array.isArray(rec.blocked) ? rec.blocked : [],
+			ms: rec.ms ?? null,
+			guards: (Array.isArray(rec.results) ? rec.results : []).map((g) => ({ guard: g.guard, level: g.level, pass: Boolean(g.pass), findings: Number(g.findings) || 0 })),
+		};
+	} catch {
+		return { ...base, record: null };
+	}
+}
+
+// Download the gel-record artifact of a run and return gel-record.jsonl's text. Throws on any failure.
+async function fetchGelRecord(run) {
+	const headers = { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", authorization: `Bearer ${process.env.GITHUB_TOKEN}` };
+	const repo = run.repository?.full_name ?? `${ORG}/${run.repository?.name}`;
+	const list = await gh(`/repos/${repo}/actions/runs/${run.id}/artifacts`);
+	const art = (list.artifacts || []).find((a) => a.name === "gel-record" && !a.expired);
+	if (!art) throw new Error("no gel-record artifact");
+	// The archive URL redirects to a signed host; follow it by hand so the token is not sent there.
+	let res = await fetch(art.archive_download_url, { headers, redirect: "manual" });
+	if (res.status >= 300 && res.status < 400) res = await fetch(res.headers.get("location"));
+	if (!res.ok) throw new Error(`artifact download: HTTP ${res.status}`);
+	const dir = mkdtempSync(join(tmpdir(), "gel-"));
+	try {
+		const zip = join(dir, "a.zip");
+		writeFileSync(zip, Buffer.from(await res.arrayBuffer()));
+		return execFileSync("unzip", ["-p", zip, "gel-record.jsonl"], { encoding: "utf8", maxBuffer: 16e6 });
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+async function collectGel(runs) {
+	const run = findGelRun(runs);
+	if (!run) return { installed: false };
+	try {
+		return gelFromRecord(await fetchGelRecord(run), run);
+	} catch {
+		return gelFromRecord(null, run);
+	}
 }
 
 export function totals(repos) {
@@ -161,7 +224,10 @@ export function totals(repos) {
 		runs,
 		ciMinutes: repos.reduce((n, r) => n + (r.ciMinutes ?? 0), 0),
 		flaky: repos.reduce((n, r) => n + r.workflows.filter((w) => w.flaky).length, 0),
-		sdlcReady: repos.filter((r) => r.sdlc?.score === 4).length,
+		sdlcReady: repos.filter((r) => r.sdlc?.score === 5).length,
+		gelRepos: repos.filter((r) => r.gel?.installed).length,
+		gelFindings: repos.reduce((n, r) => n + (r.gel?.guards ?? []).filter((g) => !g.pass).reduce((m, g) => m + (g.findings || 0), 0), 0),
+		gelBlocked: repos.filter((r) => (r.gel?.blocked ?? []).length > 0).length,
 	};
 }
 
@@ -180,6 +246,7 @@ async function collect(now) {
 			rootNames = (await gh(`/repos/${ORG}/${r.name}/contents/?ref=${encodeURIComponent(r.default_branch)}`)).map((f) => f.name);
 		} catch {}
 		const summary = summarizeRuns(runs, now);
+		const gel = await collectGel(runs);
 		repos.push({
 			name: r.name,
 			url: r.html_url,
@@ -188,7 +255,8 @@ async function collect(now) {
 			stars: r.stargazers_count,
 			openPRs: prs.length,
 			...summary,
-			sdlc: sdlcFlags(rootNames, summary.workflows.length),
+			gel,
+			sdlc: sdlcFlags(rootNames, summary.workflows.length, gel.installed),
 		});
 	}
 	repos.sort((a, b) => b.red - a.red || (a.passRate ?? 101) - (b.passRate ?? 101) || a.name.localeCompare(b.name));
@@ -227,6 +295,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 			openPRs: t.openPRs,
 			runs: t.runs,
 			flaky: t.flaky,
+			gelRepos: t.gelRepos,
 			scoresFailing: data.scores ? data.scores.rows.filter((r) => ["fail", "error"].includes(r.status)).length : null,
 		});
 		writeFileSync(values.history, `${JSON.stringify(history.slice(-HISTORY_MAX))}\n`);
