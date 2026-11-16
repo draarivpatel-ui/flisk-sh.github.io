@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { dailyCounts, median, percentile, sdlcFlags, summarizeRuns, totals, workflowStats } from "./collect.mjs";
+import { dailyCounts, findGelRun, gelFromRecord, median, percentile, sdlcFlags, summarizeRuns, totals, workflowStats } from "./collect.mjs";
 
 const NOW = Date.parse("2026-11-12T12:00:00Z");
 const run = (workflow_id, name, conclusion, status = "completed", day = "2026-11-12") => ({
@@ -56,7 +56,7 @@ test("totals weights pass rate by runs", () => {
 		{ workflows: [{}, {}], red: 0, runs: 30, passRate: 100, openPRs: 0, ciMinutes: 3 },
 		{ workflows: [], red: 0, runs: 0, passRate: null, openPRs: 1 },
 	]);
-	assert.deepEqual(t, { repos: 3, workflows: 3, red: 1, redRepos: 1, passRate: 87.5, openPRs: 3, runs: 40, ciMinutes: 10, flaky: 1, sdlcReady: 0 });
+	assert.deepEqual(t, { repos: 3, workflows: 3, red: 1, redRepos: 1, passRate: 87.5, openPRs: 3, runs: 40, ciMinutes: 10, flaky: 1, sdlcReady: 0, gelRepos: 0, gelFindings: 0, gelBlocked: 0 });
 });
 
 test("median handles even, odd and empty", () => {
@@ -93,6 +93,58 @@ test("percentile picks the nearest-rank value", () => {
 });
 
 test("sdlcFlags reads the harness files from the root folder and CI from the workflow count", () => {
-	assert.deepEqual(sdlcFlags(["README.md", "AGENTS.md", ".claude"], 2), { agents: true, claude: false, settings: true, ci: true, score: 3 });
+	assert.deepEqual(sdlcFlags(["README.md", "AGENTS.md", ".claude"], 2), { agents: true, claude: false, settings: true, ci: true, gel: false, score: 3 });
 	assert.equal(sdlcFlags([], 0).score, 0);
+	assert.deepEqual(sdlcFlags(["AGENTS.md", "CLAUDE.md", ".claude"], 1, true), { agents: true, claude: true, settings: true, ci: true, gel: true, score: 5 });
+});
+
+const REC = { ts: "t", repo: "x", sha: "s", event: "pull_request", lane: "B", laneReason: "r", needsPerson: true, files: 3, results: [{ guard: "a", level: "block", pass: false, findings: 2 }, { guard: "b", level: "report", pass: true, findings: 4 }], blocked: ["a"], ms: 900 };
+const GRUN = { html_url: "https://x/gel", updated_at: "2026-11-12T10:03:00Z" };
+
+test("gelFromRecord takes the last JSON line and keeps the lane, blocked guards and per-guard findings", () => {
+	const g = gelFromRecord(`${JSON.stringify({ ...REC, lane: "A" })}\n${JSON.stringify(REC)}\n`, GRUN);
+	assert.deepEqual(g, {
+		installed: true, runUrl: "https://x/gel", at: GRUN.updated_at, lane: "B", needsPerson: true, blocked: ["a"], ms: 900,
+		guards: [{ guard: "a", level: "block", pass: false, findings: 2 }, { guard: "b", level: "report", pass: true, findings: 4 }],
+	});
+});
+
+test("gelFromRecord never throws: garbage, empty and missing records become installed with record null", () => {
+	for (const bad of ["not json", "", null, undefined, "[1]", "{"]) {
+		assert.deepEqual(gelFromRecord(bad, GRUN), { installed: true, runUrl: GRUN.html_url, at: GRUN.updated_at, record: null });
+	}
+	assert.deepEqual(gelFromRecord('{"lane":"C"}', GRUN).blocked, []);
+});
+
+test("findGelRun picks the newest completed run named GEL or ending in /gel.yml", () => {
+	const runs = [
+		{ id: 1, name: "GEL", status: "in_progress" },
+		{ id: 2, name: "CI", status: "completed" },
+		{ id: 3, name: "Guards", path: ".github/workflows/gel.yml", status: "completed" },
+		{ id: 4, name: "GEL", status: "completed" },
+	];
+	assert.equal(findGelRun(runs).id, 3);
+	assert.equal(findGelRun(runs.slice(0, 2)), undefined);
+	assert.equal(findGelRun([{ id: 9, name: "GEL dogfood", status: "completed" }]).id, 9);
+	assert.equal(findGelRun([{ id: 8, name: "GELATO", status: "completed" }]), undefined);
+});
+
+test("totals counts GEL repos, failing-guard findings and repos blocked, and tolerates repos without gel", () => {
+	const base = { workflows: [], red: 0, runs: 0, passRate: null, openPRs: 0 };
+	const t = totals([
+		{ ...base, sdlc: { score: 5 }, gel: gelFromRecord(JSON.stringify(REC), GRUN) },
+		{ ...base, sdlc: { score: 4 }, gel: { installed: true, record: null } },
+		{ ...base, gel: { installed: false } },
+		{ ...base },
+	]);
+	assert.equal(t.gelRepos, 2);
+	assert.equal(t.gelFindings, 2);
+	assert.equal(t.gelBlocked, 1);
+	assert.equal(t.sdlcReady, 1);
+});
+
+test("summarizeRuns reports p95 next to the median", () => {
+	const s = summarizeRuns([run(1, "CI", "success"), run(1, "CI", "success")], NOW);
+	assert.equal(s.p95Minutes, 3);
+	assert.equal(summarizeRuns([], NOW).p95Minutes, null);
 });
